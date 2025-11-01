@@ -1,8 +1,7 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Net;
 using System.Text;
-using System.Text.Json;
 using System.Threading.Tasks;
 
 namespace MiniHttpServer.shared
@@ -10,42 +9,18 @@ namespace MiniHttpServer.shared
     internal class HttpServer
     {
         private readonly HttpListener _listener = new();
-        private SettingsModel _config;
+        private readonly SettingsManager _settingsManager = SettingsManager.Instance;
 
         public HttpServer()
         {
             try
             {
-                LoadConfig();
                 InitConsoleInput();
+                Console.WriteLine($"Настройки загружены: {_settingsManager.Domain}:{_settingsManager.Port}, папка: {_settingsManager.PublicDirectoryPath}");
             }
             catch (Exception ex)
             {
                 Console.WriteLine("Критическая ошибка при инициализации сервера: " + ex);
-                Environment.Exit(1);
-            }
-        }
-
-        private void LoadConfig()
-        {
-            try
-            {
-                string settingsJson = File.ReadAllText("settings.json");
-                _config = JsonSerializer.Deserialize<SettingsModel>(settingsJson);
-            }
-            catch (FileNotFoundException)
-            {
-                Console.WriteLine("Файл settings.json не найден");
-                Environment.Exit(1);
-            }
-            catch (JsonException ex)
-            {
-                Console.WriteLine("Ошибка в формате JSON: " + ex.Message);
-                Environment.Exit(1);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine("Неожиданная ошибка при загрузке настроек: " + ex);
                 Environment.Exit(1);
             }
         }
@@ -67,9 +42,17 @@ namespace MiniHttpServer.shared
                             Stop();
                             Environment.Exit(0);
                         }
+                        else if (input.Trim().ToLower() == "/reload")
+                        {
+                            _settingsManager.ReloadSettings();
+                            Console.WriteLine("Настройки перезагружены");
+                            Console.WriteLine($"Обновленные настройки: {_settingsManager.Domain}:{_settingsManager.Port}, папка: {_settingsManager.PublicDirectoryPath}");
+                        }
                         else if (!string.IsNullOrEmpty(input))
                         {
-                            Console.WriteLine("Неизвестная команда. Введите /stop для остановки сервера");
+                            Console.WriteLine("Неизвестная команда. Доступные команды:");
+                            Console.WriteLine("  /stop   - остановить сервер");
+                            Console.WriteLine("  /reload - перезагрузить настройки");
                         }
                     }
                     catch (Exception ex)
@@ -84,9 +67,9 @@ namespace MiniHttpServer.shared
         {
             try
             {
-                _listener.Prefixes.Add($"http://{_config.Domain}:{_config.Port}/");
+                _listener.Prefixes.Add($"http://{_settingsManager.Domain}:{_settingsManager.Port}/");
                 _listener.Start();
-                Console.WriteLine($"Сервер запущен на http://{_config.Domain}:{_config.Port}/");
+                Console.WriteLine($"Сервер запущен на http://{_settingsManager.Domain}:{_settingsManager.Port}/");
 
                 _ = ListenLoop();
             }
@@ -126,12 +109,10 @@ namespace MiniHttpServer.shared
                 }
                 catch (HttpListenerException)
                 {
-                    // Сервер остановлен выходим из цикла
                     break;
                 }
                 catch (ObjectDisposedException)
                 {
-                    // Listener был уничтожен
                     break;
                 }
                 catch (Exception ex)
@@ -143,60 +124,74 @@ namespace MiniHttpServer.shared
 
         private async Task HandleRequest(HttpListenerContext context)
         {
+            string relativePath = context.Request.Url.AbsolutePath.TrimStart('/');
+            if (string.IsNullOrEmpty(relativePath))
+                relativePath = "index.html";
+
+            string filePath = Path.Combine(_settingsManager.PublicDirectoryPath, relativePath);
+
+            string requestSignalizer = filePath.Split(".")[1];
+            if (requestSignalizer == "html")
+                Console.WriteLine("Получен запрос!");
+
             try
             {
-                byte[] responseFile = [];
-                var request = context.Request;
-                var response = context.Response;
-
-                try
+                if (!File.Exists(filePath))
                 {
-                    string path = Path.Combine(_config.PublicDirectoryPath + request.Url.AbsolutePath);
-                    responseFile = await File.ReadAllBytesAsync(path);
-                }
-                catch (FileNotFoundException)
-                {
-                    Console.WriteLine($"Файл {request.Url.AbsolutePath} не найден");
-                    //responseFile = "<h1>404 Not Found</h1>";
-                }
-                catch (DirectoryNotFoundException)
-                {
-                    Console.WriteLine("Указан неверный путь к директории");
-                    //responseFile = "<h1>500 Internal Server Error</h1>";
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine("Ошибка при чтении файла: " + ex);
-                    //responseFile = "<h1>500 Internal Server Error</h1>";
+                    context.Response.StatusCode = 404;
+                    context.Response.ContentType = "text/html; charset=utf-8";
+                    byte[] notFound = Encoding.UTF8.GetBytes("<h1>404 Not Found</h1>");
+                    context.Response.ContentLength64 = notFound.Length;
+                    await context.Response.OutputStream.WriteAsync(notFound);
+                    context.Response.Close();
+                    return;
                 }
 
-                byte[] buffer = responseFile;
-                response.ContentLength64 = buffer.Length;
+                string contentType = GetContentType(Path.GetExtension(filePath));
+                context.Response.ContentType = contentType;
 
-                using Stream output = response.OutputStream;
-                await output.WriteAsync(buffer);
-                await output.FlushAsync();
-
-                Console.WriteLine($"Запрос от {context.Request.RemoteEndPoint} обработан");
+                byte[] fileBytes = await File.ReadAllBytesAsync(filePath);
+                context.Response.ContentLength64 = fileBytes.Length;
+                await context.Response.OutputStream.WriteAsync(fileBytes);
+                context.Response.Close();
             }
-
             catch (Exception ex)
             {
-                Console.WriteLine("Критическая ошибка при обработке запроса: " + ex);
+                Console.WriteLine($"[500] Ошибка при обработке {relativePath}: {ex.Message}");
 
                 try
                 {
-                    var response = context.Response;
+                    context.Response.StatusCode = 500;
                     byte[] buffer = Encoding.UTF8.GetBytes("<h1>500 Internal Server Error</h1>");
-                    response.ContentLength64 = buffer.Length;
-                    using Stream output = response.OutputStream;
-                    await output.WriteAsync(buffer);
+                    context.Response.ContentType = "text/html; charset=utf-8";
+                    context.Response.ContentLength64 = buffer.Length;
+                    await context.Response.OutputStream.WriteAsync(buffer);
                 }
-                catch
-                {
-
-                }
+                catch { }
             }
+        }
+
+        private static string GetContentType(string extension)
+        {
+            return extension.ToLower() switch
+            {
+                ".html" => "text/html; charset=utf-8",
+                ".htm" => "text/html; charset=utf-8",
+                ".css" => "text/css",
+                ".js" => "application/javascript",
+                ".json" => "application/json",
+                ".png" => "image/png",
+                ".jpg" => "image/jpeg",
+                ".jpeg" => "image/jpeg",
+                ".gif" => "image/gif",
+                ".svg" => "image/svg+xml",
+                ".ico" => "image/x-icon",
+                ".woff" => "font/woff",
+                ".woff2" => "font/woff2",
+                ".ttf" => "font/ttf",
+                ".txt" => "text/plain; charset=utf-8",
+                _ => "application/octet-stream"
+            };
         }
     }
 }
